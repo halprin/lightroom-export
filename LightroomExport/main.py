@@ -1,6 +1,7 @@
 # https://github.com/philroche/py-lightroom-export
 # https://github.com/patrikhson/photo-export
 # https://photo.stackexchange.com/questions/93172/where-can-i-find-lightroom-database-documentation
+# https://macosxautomation.com/applescript/imageevents/index.html
 
 # com.adobe.ag.library.group = folder
 # com.adobe.ag.library.collection = album
@@ -9,9 +10,8 @@
 # Todo:
 # - make aperture edited files show up in the original file's album
 # - when a photo is edited in Lightroom, export it it in the highest quality way possible with all the metadata, and import that photo instead
-# - For photos that are at risk for having the wrong timezone in Photos:
-#   - Determine what timezone the photo belongs to by either a) using the coordinates to find out the timezone, or b) pre-tag them with the GMT offset or timezone ID
-#   - Write the timezone into the Photos database
+# - Get the rotation correct
+# - Make it so any changes written to the Photos database are not lost when recovering the db.
 
 import sqlite3
 from typing import Optional, List, Tuple
@@ -22,6 +22,12 @@ import datetime
 import exifread
 from os import path
 import sys
+from timezonefinder import TimezoneFinder
+import pendulum
+import time
+
+
+tf = TimezoneFinder()
 
 
 create_album_apple_script_root = applescript.AppleScript("""on run album_name
@@ -81,6 +87,16 @@ assign_album_apple_script = applescript.AppleScript("""on run {photo_id, album_i
                                                        end run""")
 
 
+quit_photos_apple_script = applescript.AppleScript("""tell application "Photos"
+                                                           quit
+                                                       end tell""")
+
+
+start_photos_apple_script = applescript.AppleScript("""tell application "Photos"
+                                                           activate
+                                                       end tell""")
+
+
 def main(database_path):
     entity_tree = {}
     photo_details = {}
@@ -91,8 +107,12 @@ def main(database_path):
     stack_details = get_stack_details(photo_details)
     # print(json.dumps(stack_details, indent=4))
 
+    start_photos_apple_script.run()
+
     album_conversion = create_entities_in_photos(entity_tree)
     import_photos(photo_details, album_conversion, stack_details)
+
+    modify_photos_database(photo_details)
     # print(json.dumps(entity_tree, indent=4))
     print('Done')
 
@@ -212,7 +232,7 @@ def get_all_photo_details(db_connection):
             'file': file
         }
         # TODO: remove early break
-        # if len(photo_details) > 500:
+        # if len(photo_details) > 100:
         #     break
 
     return photo_details
@@ -251,6 +271,7 @@ def import_photos(photo_details: dict, album_conversion: dict, stack_details: di
             continue  # skip this photo since we wanted the Aperture edited version
         modify_details_for_edits(photo_id, photo_details, stack_details)
         photos_photo_id = import_photo(photo_info['file'])
+        photo_info['photos_id'] = photos_photo_id
         set_photo_metadata(photos_photo_id, photo_info)
         add_photo_to_albums(photos_photo_id, photo_info['albums'], album_conversion)
 
@@ -310,7 +331,8 @@ def set_photo_metadata(photos_photo_id: str, photo_info: dict):
     add_edits_keyword(photo_info)
     add_needs_editing_keyword(photo_info)
 
-    datetime_to_set, tag_to_add = determine_datetime(photo_info['modified_date_time'], photo_info['file'])
+    datetime_to_set, tag_to_add = determine_datetime(photo_info)
+
     if tag_to_add is not None:
         photo_info['keywords'].append(tag_to_add)
 
@@ -341,7 +363,17 @@ def add_needs_editing_keyword(photo_info: dict):
 # America/Los_Angeles
 # Photos time is offset from January 1, 2001 00:00:00 UTC.
 # uuid is what is returned from AppleScript after import
-def determine_datetime(datetime_from_db_str: str, file_path: str) -> Tuple[Optional[str], Optional[str]]:
+# imageTimeZoneName is one of the above timezone names, etc.  Or a GMT-0600 string.
+# imageTimeZoneOffsetSeconds is the number of seconds from UTC the resulting timezone is in, and takes into account DST
+# imageDate is the number of seconds from 2001 to timezone aware time, probably accounts for DST.  When changing the timezone, I'll need to adjust this field
+# createDate is the number of seconds from 2001 to when the photo was imported into Photos, but it isn't timezone aware, just take the UTC time to mean my time.  We don't need to do anything with this field.
+def determine_datetime(photo_info: dict) -> Tuple[Optional[str], Optional[str]]:
+    datetime_from_db_str = photo_info['modified_date_time']
+    file_path = photo_info['file']
+    latitude = photo_info['latitude']
+    longitude = photo_info['longitude']
+    keywords = photo_info['keywords']
+
     with open(file_path, 'rb') as image_file:
         exif_tags = exifread.process_file(image_file, details=False)
 
@@ -356,8 +388,19 @@ def determine_datetime(datetime_from_db_str: str, file_path: str) -> Tuple[Optio
     datetime_to_set = None
     tag_to_add = None
 
-    if 'GPS GPSTimeStamp' not in exif_tags or 'GPS GPSDate' not in exif_tags:
+    if 'GPS GPSTimeStamp' not in exif_tags or 'GPS GPSDate' not in exif_tags or file_path[-3:] == 'CR2' or file_path[-3:] == 'cr2':
         tag_to_add = 'timezone suspect'
+        print('Timezone is suspect')
+        timezone_keyword = extract_timezone_from_keywords(keywords)
+        if timezone_keyword is not None:
+            print('...but tz in keywords {}'.format(timezone_keyword))
+            photo_info['timezone'] = timezone_keyword
+            tag_to_add = 'timezone edited'
+        elif latitude is not None and longitude is not None:
+            timezone = tf.timezone_at(lat=latitude, lng=longitude)
+            print('...but looking up lat/long tz is {}'.format(timezone))
+            photo_info['timezone'] = timezone
+            tag_to_add = 'timezone edited'
         gps_time = False
     else:
         gps_time = True
@@ -365,8 +408,10 @@ def determine_datetime(datetime_from_db_str: str, file_path: str) -> Tuple[Optio
     # Determine if they are equal, if they are, return None since we just want Photos to use what is built into the photo
     if db_datetime == exif_datetime:
         datetime_to_set = None
+        photo_info['datetime_photos'] = exif_datetime
     elif db_datetime is None:
         datetime_to_set = None
+        photo_info['datetime_photos'] = exif_datetime
     else:
         # not equal!  Go check to see if this photo has GPS coordinates built in.
         print('Times are not equal!')
@@ -374,11 +419,25 @@ def determine_datetime(datetime_from_db_str: str, file_path: str) -> Tuple[Optio
             # there are coordinates, don't change the time because Photos will screw it up!
             print('But there is GPS time')
             datetime_to_set = None
+            photo_info['datetime_photos'] = exif_datetime
             tag_to_add = 'gps with bad time'
         else:
             datetime_to_set = convert_datetime_to_applescript(db_datetime)
+            photo_info['datetime_photos'] = db_datetime
 
     return (datetime_to_set, tag_to_add)
+
+
+def extract_timezone_from_keywords(keywords: list) -> Optional[str]:
+    timezone_keywords = [keyword for keyword in keywords if keyword[:3] == 'tz-']
+    if len(timezone_keywords) > 1:
+        print('Multiple timezone keywords!')
+        return None
+    elif len(timezone_keywords) == 0:
+        return None
+    else:
+        keywords.remove(timezone_keywords[0])
+        return timezone_keywords[0][3:]
 
 
 def datetime_from_db(datetime_str: str) -> Optional[datetime.datetime]:
@@ -400,8 +459,12 @@ def datetime_from_db(datetime_str: str) -> Optional[datetime.datetime]:
 def datetime_from_exif(datetime_str: str) -> Optional[datetime.datetime]:
     if datetime_str is None:
         return None
+    try:
+        exif_datetime = datetime.datetime.strptime(datetime_str, '%Y:%m:%d %H:%M:%S')
+    except ValueError:
+        exif_datetime = None
 
-    return datetime.datetime.strptime(datetime_str, '%Y:%m:%d %H:%M:%S')
+    return exif_datetime
 
 
 def convert_datetime_to_applescript(date_time: datetime.datetime) -> Optional[str]:
@@ -421,6 +484,56 @@ def add_photo_to_albums(photos_photo_id: str, lightroom_album_ids: List[int], al
             assign_album_apple_script.run(photos_photo_id, album_conversion[lightroom_album_id])
         except KeyError:
             pass  # a photo was slated to go into an album that I decided not to move over, like a slideshow "album"
+
+
+def modify_photos_database(photo_details: dict):
+    time.sleep(20.0)
+    print('Quitting Photos')
+    quit_photos_apple_script.run()
+
+    input("Press return to continue to edit the Photos' database")
+
+    print("Starting edit of Photos' database")
+
+    photos_database_path = '/Users/halprin/Pictures/Photos Library.photoslibrary/database/photos.db'
+    write_time_data_into_version_query = """UPDATE RKVersion
+                                               SET imageDate = ?,
+                                                   imageTimeZoneOffsetSeconds = ?,
+                                                   imageTimeZoneName = ?
+                                               WHERE uuid = ?"""
+
+    # mountain_timezone = pendulum.timezone('America/Denver')
+    # utc_timezone = pendulum.timezone('UTC')
+    utc_2001 = pendulum.datetime(2001, 1, 1, 0, 0, 0, tz='UTC')
+
+    with sqlite3.connect(photos_database_path) as photo_db_connection:
+        for photo_key in photo_details:
+            photo_info = photo_details[photo_key]
+
+            if 'timezone' not in photo_info:
+                continue
+
+            photos_id = photo_info['photos_id']
+            timezone_str = photo_info['timezone']
+            photo_datetime = photo_info['datetime_photos']
+
+            if not isinstance(photo_datetime, datetime.datetime):
+                print("id {} doesn't have a proper datetime!  date={}, date type={}".format(photos_id, photo_datetime, type(photo_datetime)))
+                print('Not setting timezone after all')
+                continue
+
+            timezone = pendulum.timezone(timezone_str)
+            photo_datetime_with_timezone = pendulum.instance(photo_datetime, timezone)
+
+            new_image_date_period = photo_datetime_with_timezone - utc_2001
+            new_image_creation = new_image_date_period.in_seconds()
+
+            # utc_offset = timezone.utcoffset(photo_datetime)
+            timezone_delta = photo_datetime_with_timezone.offset
+
+            print('name={}, id={}, timezone={}, timezone_delta={}, date={}'.format(photo_info['name'], photos_id, timezone_str, timezone_delta, new_image_creation))
+
+            photo_db_connection.execute(write_time_data_into_version_query, (new_image_creation, timezone_delta, timezone_str, photos_id))
 
 
 if __name__ == '__main__':
