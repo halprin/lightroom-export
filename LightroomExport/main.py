@@ -2,6 +2,7 @@
 # https://github.com/patrikhson/photo-export
 # https://photo.stackexchange.com/questions/93172/where-can-i-find-lightroom-database-documentation
 # https://macosxautomation.com/applescript/imageevents/index.html
+# https://discussions.apple.com/thread/6874314
 
 # com.adobe.ag.library.group = folder
 # com.adobe.ag.library.collection = album
@@ -21,10 +22,12 @@ from xml.etree import ElementTree
 import datetime
 import exifread
 from os import path
+import os
 import sys
 from timezonefinder import TimezoneFinder
 import pendulum
 import time
+import subprocess
 
 
 tf = TimezoneFinder()
@@ -112,8 +115,9 @@ def main(database_path):
     album_conversion = create_entities_in_photos(entity_tree)
     import_photos(photo_details, album_conversion, stack_details)
 
-    modify_photos_database(photo_details)
+    # modify_photos_database(photos_library_path, photo_details)
     # print(json.dumps(entity_tree, indent=4))
+    set_timezone('America/Denver')
     print('Done')
 
 
@@ -270,6 +274,8 @@ def import_photos(photo_details: dict, album_conversion: dict, stack_details: di
             print('Skipping import of {} because Aperture edits'.format(photo_id))
             continue  # skip this photo since we wanted the Aperture edited version
         modify_details_for_edits(photo_id, photo_details, stack_details)
+        generate_photo_metadata(photo_info)
+        set_timezone(photo_info.get('timezone', None))
         photos_photo_id = import_photo(photo_info['file'])
         photo_info['photos_id'] = photos_photo_id
         set_photo_metadata(photos_photo_id, photo_info)
@@ -318,14 +324,23 @@ def modify_details_for_edits(photo_id: int, photo_details: dict, stack_details: 
             photo_info['albums'] += photo_details[sister_photo_id]['albums']
 
 
+def set_timezone(timezone: str):
+    if timezone is None:
+        timezone = 'America/Denver'
+
+    print('Setting timezone to {}'.format(timezone))
+    subprocess.run(['sudo', '-S', '/usr/sbin/systemsetup', '-settimezone', timezone],
+                   input=bytes('{}\n'.format(os.environ['SUDO_PSW']), 'utf-8'))
+
+
 def import_photo(file_path) -> str:
     print('Importing {}'.format(file_path))
     result = import_photo_apple_script.run(file_path)
     return result[0][applescript.AEType(b'seld')]
 
 
-def set_photo_metadata(photos_photo_id: str, photo_info: dict):
-    print('Setting metadata to {} ({}): {}'.format(photos_photo_id, photo_info['name'], photo_info['file']))
+def generate_photo_metadata(photo_info: dict):
+    print('Generating metadata to {}: {}'.format(photo_info['name'], photo_info['file']))
 
     add_no_album_keyword(photo_info)
     add_edits_keyword(photo_info)
@@ -333,10 +348,16 @@ def set_photo_metadata(photos_photo_id: str, photo_info: dict):
 
     datetime_to_set, tag_to_add = determine_datetime(photo_info)
 
+    photo_info['applescript_datetime'] = datetime_to_set
+
     if tag_to_add is not None:
         photo_info['keywords'].append(tag_to_add)
 
-    set_metadata_apple_script.run(photos_photo_id, photo_info['name'], datetime_to_set, photo_info['rating'], photo_info['latitude'], photo_info['longitude'], photo_info['keywords'])
+
+def set_photo_metadata(photos_photo_id: str, photo_info: dict):
+    print('Setting metadata to {} ({}): {}'.format(photos_photo_id, photo_info['name'], photo_info['file']))
+
+    set_metadata_apple_script.run(photos_photo_id, photo_info['name'], photo_info['applescript_datetime'], photo_info['rating'], photo_info['latitude'], photo_info['longitude'], photo_info['keywords'])
 
 
 def add_no_album_keyword(photo_info: dict):
@@ -486,7 +507,7 @@ def add_photo_to_albums(photos_photo_id: str, lightroom_album_ids: List[int], al
             pass  # a photo was slated to go into an album that I decided not to move over, like a slideshow "album"
 
 
-def modify_photos_database(photo_details: dict):
+def modify_photos_database(photos_library_path: str, photo_details: dict):
     time.sleep(20.0)
     print('Quitting Photos')
     quit_photos_apple_script.run()
@@ -495,7 +516,7 @@ def modify_photos_database(photo_details: dict):
 
     print("Starting edit of Photos' database")
 
-    photos_database_path = '/Users/halprin/Pictures/Photos Library.photoslibrary/database/photos.db'
+    photos_database_path = '{}/database/photos.db'.format(photos_library_path)
     write_time_data_into_version_query = """UPDATE RKVersion
                                                SET imageDate = ?,
                                                    imageTimeZoneOffsetSeconds = ?,
