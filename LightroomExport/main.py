@@ -11,8 +11,6 @@
 # Todo:
 # - make aperture edited files show up in the original file's album
 # - when a photo is edited in Lightroom, export it it in the highest quality way possible with all the metadata, and import that photo instead
-# - Get the rotation correct
-# - Make it so any changes written to the Photos database are not lost when recovering the db.
 
 import sqlite3
 from typing import Optional, List, Tuple
@@ -28,6 +26,7 @@ from timezonefinder import TimezoneFinder
 import pendulum
 import time
 import subprocess
+import shutil
 
 
 tf = TimezoneFinder()
@@ -207,7 +206,7 @@ def create_album_in_photos(name: str, parent_entity_name: Optional[str]) -> str:
 def get_all_photo_details(db_connection):
     photo_details = {}
 
-    all_details_query = """SELECT Adobe_images.id_local as photo_id, Adobe_images.rating as rating,
+    all_details_query = """SELECT Adobe_images.id_local as photo_id, Adobe_images.orientation as orientation, Adobe_images.rating as rating,
                                   AgHarvestedExifMetadata.gpsLatitude as latitude, AgHarvestedExifMetadata.gpsLongitude as longitude,
                                   AgLibraryRootFolder.absolutePath || AgLibraryFolder.pathFromRoot || AgLibraryFile.baseName || '.' || AgLibraryFile.extension as file,
                                   Adobe_AdditionalMetadata.xmp, Adobe_images.captureTime, Adobe_imageDevelopSettings.hasDevelopAdjustmentsEx as edits,
@@ -221,11 +220,12 @@ def get_all_photo_details(db_connection):
                            JOIN Adobe_imageDevelopSettings ON Adobe_imageDevelopSettings.image = Adobe_images.id_local
                            LEFT JOIN AgLibraryFolderStackImage ON AgLibraryFolderStackImage.image = Adobe_images.id_local"""
 
-    for (image_id, rating, latitude, longitude, file, xmp, date_time, edits, stack, colorLabels) in db_connection.execute(all_details_query):
+    for (image_id, orientation, rating, latitude, longitude, file, xmp, date_time, edits, stack, colorLabels) in db_connection.execute(all_details_query):
         photo_details[image_id] = {
             'name': extract_name_from_xmp(xmp),
             'modified_date_time': date_time,
             'rating': rating,
+            'orientation': orientation,
             'latitude': latitude,
             'longitude': longitude,
             'albums': get_associated_album_ids_for_picture(image_id, db_connection),
@@ -275,11 +275,32 @@ def import_photos(photo_details: dict, album_conversion: dict, stack_details: di
             continue  # skip this photo since we wanted the Aperture edited version
         modify_details_for_edits(photo_id, photo_details, stack_details)
         generate_photo_metadata(photo_info)
+        rotate_image(photo_info)
         set_timezone(photo_info.get('timezone', None))
         photos_photo_id = import_photo(photo_info['file'])
         photo_info['photos_id'] = photos_photo_id
         set_photo_metadata(photos_photo_id, photo_info)
         add_photo_to_albums(photos_photo_id, photo_info['albums'], album_conversion)
+
+
+def rotate_image(photo_info: dict):
+    orientation_converter = {
+        'AB': 1,
+        'BC': 6,
+        'CD': 3,
+        'DA': 8
+    }
+
+    if photo_info['orientation'] is None or photo_info['exif_orientation'] is None:
+        return
+
+    lightroom_orientation = orientation_converter[photo_info['orientation']]
+    exif_orientation = photo_info['exif_orientation']
+
+    if lightroom_orientation != exif_orientation:
+        print('Rotating to {}'.format(lightroom_orientation))
+        photo_info['file'] = shutil.copy2(photo_info['file'], path.expanduser('~/Pictures/rotate/'))
+        subprocess.run(['/usr/local/bin/exiftool', '-overwrite_original', '-orientation#={}'.format(lightroom_orientation), photo_info['file']])
 
 
 def photo_paired_with_aperture_software_edits(photo_id: int, stack_id: int, stack_details: dict, photo_details: dict) -> bool:
@@ -397,6 +418,11 @@ def determine_datetime(photo_info: dict) -> Tuple[Optional[str], Optional[str]]:
 
     with open(file_path, 'rb') as image_file:
         exif_tags = exifread.process_file(image_file, details=False)
+
+    try:
+        photo_info['exif_orientation'] = exif_tags['Image Orientation'].values[0]
+    except KeyError:
+        photo_info['exif_orientation'] = None
 
     try:
         datetime_from_exif_str = exif_tags['EXIF DateTimeOriginal'].values
