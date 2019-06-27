@@ -6,15 +6,10 @@
 
 # com.adobe.ag.library.group = folder
 # com.adobe.ag.library.collection = album
-# 37 top level things
 
-# Todo:
-# - make aperture edited files show up in the original file's album
-# - when a photo is edited in Lightroom, export it it in the highest quality way possible with all the metadata, and import that photo instead
 
 import sqlite3
 from typing import Optional, List, Tuple
-import json
 import applescript
 from xml.etree import ElementTree
 import datetime
@@ -99,6 +94,9 @@ start_photos_apple_script = applescript.AppleScript("""tell application "Photos"
                                                        end tell""")
 
 
+lighroom_edits_folder = '/Users/someone/Pictures/Lightroom/Edits/Real Edits/'
+
+
 def main(database_path):
     entity_tree = {}
     photo_details = {}
@@ -107,14 +105,12 @@ def main(database_path):
         entity_tree = read_entities_with_parent(None, db_connection)
         photo_details = get_all_photo_details(db_connection)
     stack_details = get_stack_details(photo_details)
-    # print(json.dumps(stack_details, indent=4))
 
     start_photos_apple_script.run()
 
     album_conversion = create_entities_in_photos(entity_tree)
     import_photos(photo_details, album_conversion, stack_details)
 
-    # modify_photos_database(photos_library_path, photo_details)
     # print(json.dumps(entity_tree, indent=4))
     set_timezone('America/Denver')
     print('Done')
@@ -265,7 +261,7 @@ def get_associated_keywords_for_picture(picture_id: int, db_connection) -> List[
                                    JOIN AgLibraryKeyword ON AgLibraryKeyword.id_local == AgLibraryKeywordImage.tag
                                    WHERE AgLibraryKeywordImage.image = ?"""
 
-    return [keyword for (keyword,) in db_connection.execute(picture_collections_query, (picture_id,))]
+    return [keyword for (keyword,) in db_connection.execute(picture_collections_query, (picture_id,)) if 'Aperture Stack ' not in keyword]
 
 
 def import_photos(photo_details: dict, album_conversion: dict, stack_details: dict):
@@ -273,6 +269,7 @@ def import_photos(photo_details: dict, album_conversion: dict, stack_details: di
         if photo_paired_with_aperture_software_edits(photo_id, photo_info['stack'], stack_details, photo_details):
             print('Skipping import of {} because Aperture edits'.format(photo_id))
             continue  # skip this photo since we wanted the Aperture edited version
+        modify_details_for_lightroom_edits(photo_id, photo_details)
         modify_details_for_edits(photo_id, photo_details, stack_details)
         generate_photo_metadata(photo_info)
         rotate_image(photo_info)
@@ -328,6 +325,14 @@ def find_sister_photo_associated_with_aperture_edits(photo_id: int, stack_id: in
             return other_photo_id
 
     return None
+
+
+def modify_details_for_lightroom_edits(photo_id: int, photo_details: dict):
+    photo_info = photo_details[photo_id]
+    if photo_info['edits'] is True:
+        base_name = path.splitext(path.basename(photo_info['file']))[0]
+        new_path = path.join(lighroom_edits_folder, f'{base_name}.tif')
+        photo_info['file'] = new_path
 
 
 def modify_details_for_edits(photo_id: int, photo_details: dict, stack_details: dict):
@@ -388,7 +393,8 @@ def add_no_album_keyword(photo_info: dict):
 
 def add_edits_keyword(photo_info: dict):
     if photo_info['edits'] is True:
-        photo_info['keywords'].append('edits')
+        # photo_info['keywords'].append('edits')
+        pass
 
 
 def add_needs_editing_keyword(photo_info: dict):
@@ -442,12 +448,12 @@ def determine_datetime(photo_info: dict) -> Tuple[Optional[str], Optional[str]]:
         if timezone_keyword is not None:
             print('...but tz in keywords {}'.format(timezone_keyword))
             photo_info['timezone'] = timezone_keyword
-            tag_to_add = 'timezone edited'
+            tag_to_add = None
         elif latitude is not None and longitude is not None:
             timezone = tf.timezone_at(lat=latitude, lng=longitude)
             print('...but looking up lat/long tz is {}'.format(timezone))
             photo_info['timezone'] = timezone
-            tag_to_add = 'timezone edited'
+            tag_to_add = None
         gps_time = False
     else:
         gps_time = True
@@ -531,56 +537,6 @@ def add_photo_to_albums(photos_photo_id: str, lightroom_album_ids: List[int], al
             assign_album_apple_script.run(photos_photo_id, album_conversion[lightroom_album_id])
         except KeyError:
             pass  # a photo was slated to go into an album that I decided not to move over, like a slideshow "album"
-
-
-def modify_photos_database(photos_library_path: str, photo_details: dict):
-    time.sleep(20.0)
-    print('Quitting Photos')
-    quit_photos_apple_script.run()
-
-    input("Press return to continue to edit the Photos' database")
-
-    print("Starting edit of Photos' database")
-
-    photos_database_path = '{}/database/photos.db'.format(photos_library_path)
-    write_time_data_into_version_query = """UPDATE RKVersion
-                                               SET imageDate = ?,
-                                                   imageTimeZoneOffsetSeconds = ?,
-                                                   imageTimeZoneName = ?
-                                               WHERE uuid = ?"""
-
-    # mountain_timezone = pendulum.timezone('America/Denver')
-    # utc_timezone = pendulum.timezone('UTC')
-    utc_2001 = pendulum.datetime(2001, 1, 1, 0, 0, 0, tz='UTC')
-
-    with sqlite3.connect(photos_database_path) as photo_db_connection:
-        for photo_key in photo_details:
-            photo_info = photo_details[photo_key]
-
-            if 'timezone' not in photo_info:
-                continue
-
-            photos_id = photo_info['photos_id']
-            timezone_str = photo_info['timezone']
-            photo_datetime = photo_info['datetime_photos']
-
-            if not isinstance(photo_datetime, datetime.datetime):
-                print("id {} doesn't have a proper datetime!  date={}, date type={}".format(photos_id, photo_datetime, type(photo_datetime)))
-                print('Not setting timezone after all')
-                continue
-
-            timezone = pendulum.timezone(timezone_str)
-            photo_datetime_with_timezone = pendulum.instance(photo_datetime, timezone)
-
-            new_image_date_period = photo_datetime_with_timezone - utc_2001
-            new_image_creation = new_image_date_period.in_seconds()
-
-            # utc_offset = timezone.utcoffset(photo_datetime)
-            timezone_delta = photo_datetime_with_timezone.offset
-
-            print('name={}, id={}, timezone={}, timezone_delta={}, date={}'.format(photo_info['name'], photos_id, timezone_str, timezone_delta, new_image_creation))
-
-            photo_db_connection.execute(write_time_data_into_version_query, (new_image_creation, timezone_delta, timezone_str, photos_id))
 
 
 if __name__ == '__main__':
